@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+*.dmg
+*.p12
+
+# Build artifacts
+alacritty-source/
+target/
+
+# Temporary files
+*.tmp

@@ -1,0 +1,18 @@
+NOTICE
+
+This repository provides signed builds of Alacritty for macOS built from source.
+
+Alacritty
+Copyright 2016 Joe Wilm
+Licensed under the Apache License, Version 2.0
+https://github.com/alacritty/alacritty
+
+This repository builds Alacritty from the official source code and signs
+the resulting binaries with an Apple Developer ID certificate to comply
+with macOS Gatekeeper requirements.
+
+The original Alacritty project can be found at:
+https://github.com/alacritty/alacritty
+
+All credit for Alacritty itself goes to its original authors and
+contributors.

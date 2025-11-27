@@ -1,0 +1,317 @@
+name: Build, Sign, and Notarize Alacritty
+
+on:
+  schedule:
+    # Fallback check once per day (Alacritty releases are infrequent)
+    # Use webhooks for real-time triggering (see WEBHOOKS.md)
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      alacritty_version:
+        description: 'Alacritty version to build (e.g., v0.13.1). Leave empty to build latest.'
+        required: false
+        type: string
+  # Uncomment below to enable triggering via GitHub API / Pipedream / etc
+  # repository_dispatch:
+  #   types: [build-alacritty]
+
+jobs:
+  check-and-build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest Alacritty release
+        id: alacritty_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.alacritty_version }}" ]; then
+            VERSION="${{ inputs.alacritty_version }}"
+          else
+            VERSION=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/alacritty/alacritty/releases/latest | jq -r '.tag_name')
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version_number=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "Latest Alacritty version: $VERSION"
+
+      - name: Check if version already exists
+        id: check_version
+        run: |
+          VERSION="${{ steps.alacritty_release.outputs.version }}"
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Version $VERSION already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Version $VERSION is new"
+          fi
+
+      - name: Clone Alacritty
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          git clone --depth 1 --branch ${{ steps.alacritty_release.outputs.version }} https://github.com/alacritty/alacritty.git alacritty-source
+
+      - name: Verify GPG signature on Alacritty tag
+        if: steps.check_version.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd alacritty-source
+
+          # Expected GPG key fingerprint (Christian Duerr - primary Alacritty maintainer)
+          # Last verified: 2025-11-26
+          # If this key changes, verify the new key manually before updating
+          EXPECTED_KEY="85CDAE3C164BA7B4"
+
+          # Fetch current GPG keys from GitHub API for comparison
+          echo "Checking GitHub for verified GPG keys..."
+          GITHUB_KEYS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/users/chrisduerr/gpg_keys | jq -r '.[].key_id')
+
+          # Import the expected key from keyserver
+          echo "Importing expected key: $EXPECTED_KEY"
+          gpg --keyserver keys.openpgp.org --recv-keys "$EXPECTED_KEY" || \
+          gpg --keyserver keyserver.ubuntu.com --recv-keys "$EXPECTED_KEY"
+
+          # Check if expected key is still in GitHub (warn if not)
+          if ! echo "$GITHUB_KEYS" | grep -q "$EXPECTED_KEY"; then
+            echo "⚠️  WARNING: Expected GPG key $EXPECTED_KEY not found in GitHub account!"
+            echo "This could indicate:"
+            echo "  1. Key was legitimately rotated (check Alacritty announcements)"
+            echo "  2. GitHub account was compromised"
+            echo "  3. Key expired"
+            echo ""
+            echo "Current keys in GitHub: $GITHUB_KEYS"
+            echo ""
+            echo "SECURITY: Failing build. Update EXPECTED_KEY in workflow after manual verification."
+            exit 1
+          fi
+
+          # Verify the tag signature
+          VERSION="${{ steps.alacritty_release.outputs.version }}"
+          echo "Verifying GPG signature on tag $VERSION..."
+
+          if ! git verify-tag "$VERSION" 2>&1 | grep -q "Good signature"; then
+            echo "❌ ERROR: GPG signature verification failed for tag $VERSION"
+            echo "This could indicate a compromised release. Aborting build."
+            git verify-tag "$VERSION"
+            exit 1
+          fi
+
+          echo "✓ GPG signature verified successfully for $VERSION"
+          echo "✓ Signed with expected key $EXPECTED_KEY"
+          cd ..
+
+      - name: Install Rust
+        if: steps.check_version.outputs.exists == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          # Install scdoc for man page generation
+          brew install scdoc
+
+      - name: Build Alacritty
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          cd alacritty-source
+          make app
+          cd ..
+
+      - name: Import signing certificate
+        if: steps.check_version.outputs.exists == 'false'
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Import certificate
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          echo -n "$CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+          security import $CERTIFICATE_PATH -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          # Set partition list to allow codesign to access the keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+      - name: Sign Alacritty
+        if: steps.check_version.outputs.exists == 'false'
+        env:
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          codesign --force --deep --sign "$SIGNING_IDENTITY" \
+            --options runtime \
+            --entitlements .github/workflows/entitlements.plist \
+            alacritty-source/target/release/osx/Alacritty.app
+          codesign --verify --verbose alacritty-source/target/release/osx/Alacritty.app
+
+      - name: Create ZIP for notarization
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          ditto -c -k --keepParent alacritty-source/target/release/osx/Alacritty.app Alacritty.zip
+
+      - name: Notarize with Apple
+        if: steps.check_version.outputs.exists == 'false'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          echo "Submitting app for notarization..."
+          xcrun notarytool submit Alacritty.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+
+          echo "Stapling notarization ticket to app..."
+          xcrun stapler staple alacritty-source/target/release/osx/Alacritty.app
+          spctl --assess --type execute --verbose alacritty-source/target/release/osx/Alacritty.app
+
+          echo "✓ Notarization complete!"
+
+      - name: Create DMG
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.alacritty_release.outputs.version_number }}"
+          brew install create-dmg
+          create-dmg \
+            --volname "Alacritty" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --icon "Alacritty.app" 200 190 \
+            --hide-extension "Alacritty.app" \
+            --app-drop-link 600 185 \
+            "Alacritty-${VERSION}-signed.dmg" \
+            "alacritty-source/target/release/osx/Alacritty.app" || true
+
+          # create-dmg might fail but still create the DMG
+          if [ ! -f "Alacritty-${VERSION}-signed.dmg" ]; then
+            echo "Error: DMG creation failed"
+            exit 1
+          fi
+
+      - name: Sign DMG
+        if: steps.check_version.outputs.exists == 'false'
+        env:
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          VERSION="${{ steps.alacritty_release.outputs.version_number }}"
+          codesign --sign "$SIGNING_IDENTITY" "Alacritty-${VERSION}-signed.dmg"
+          codesign --verify --verbose "Alacritty-${VERSION}-signed.dmg"
+
+      - name: Calculate SHA256
+        if: steps.check_version.outputs.exists == 'false'
+        id: sha256
+        run: |
+          VERSION="${{ steps.alacritty_release.outputs.version_number }}"
+          SHA256=$(shasum -a 256 "Alacritty-${VERSION}-signed.dmg" | awk '{print $1}')
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "SHA256: $SHA256"
+
+      - name: Create Release
+        if: steps.check_version.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.alacritty_release.outputs.version }}"
+          VERSION_NUMBER="${{ steps.alacritty_release.outputs.version_number }}"
+          SHA256="${{ steps.sha256.outputs.sha256 }}"
+
+          gh release create "$VERSION" \
+            "Alacritty-${VERSION_NUMBER}-signed.dmg" \
+            --title "Alacritty $VERSION (Signed & Notarized)" \
+            --notes-file - << EOF
+          Signed and notarized build of Alacritty $VERSION
+
+          **SHA256:** \`$SHA256\`
+
+          This build is:
+          - ✅ Built from verified GPG-signed source code
+          - ✅ Code-signed with a valid Apple Developer ID certificate
+          - ✅ Notarized by Apple (no security warnings)
+
+          **Original Release:** https://github.com/alacritty/alacritty/releases/tag/${VERSION}
+
+          **Installation:**
+          \`\`\`bash
+          brew tap mattness/alacritty
+          brew install --cask alacritty-signed
+          \`\`\`
+
+          **Verification:**
+          \`\`\`bash
+          # Verify code signature
+          codesign -vv /Applications/Alacritty.app
+
+          # Verify notarization
+          spctl --assess --type execute --verbose /Applications/Alacritty.app
+          \`\`\`
+          EOF
+
+      - name: Update Homebrew Cask
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.alacritty_release.outputs.version }}"
+          VERSION_NUMBER="${{ steps.alacritty_release.outputs.version_number }}"
+          SHA256="${{ steps.sha256.outputs.sha256 }}"
+
+          cat > Casks/alacritty-signed.rb << EOF
+          cask "alacritty-signed" do
+            version "${VERSION_NUMBER}"
+            sha256 "${SHA256}"
+
+            url "https://github.com/${{ github.repository }}/releases/download/${VERSION}/Alacritty-#{version}-signed.dmg"
+            name "Alacritty (Signed & Notarized)"
+            desc "GPU-accelerated terminal emulator (code-signed and notarized build)"
+            homepage "https://github.com/alacritty/alacritty/"
+
+            livecheck do
+              url :url
+              strategy :github_latest
+            end
+
+            depends_on macos: ">= :big_sur"
+
+            app "Alacritty.app"
+            binary "#{appdir}/Alacritty.app/Contents/MacOS/alacritty"
+            binary "#{appdir}/Alacritty.app/Contents/Resources/61/alacritty",
+                   target: "#{ENV.fetch("TERMINFO", "~/.terminfo")}/61/alacritty"
+            binary "#{appdir}/Alacritty.app/Contents/Resources/61/alacritty-direct",
+                   target: "#{ENV.fetch("TERMINFO", "~/.terminfo")}/61/alacritty-direct"
+            manpage "#{appdir}/Alacritty.app/Contents/Resources/alacritty.1.gz"
+            manpage "#{appdir}/Alacritty.app/Contents/Resources/alacritty.5.gz"
+            manpage "#{appdir}/Alacritty.app/Contents/Resources/alacritty-msg.1.gz"
+            manpage "#{appdir}/Alacritty.app/Contents/Resources/alacritty-bindings.5.gz"
+            bash_completion "#{appdir}/Alacritty.app/Contents/Resources/completions/alacritty.bash"
+            fish_completion "#{appdir}/Alacritty.app/Contents/Resources/completions/alacritty.fish"
+            zsh_completion "#{appdir}/Alacritty.app/Contents/Resources/completions/_alacritty"
+
+            zap trash: [
+              "~/Library/Preferences/org.alacritty.plist",
+              "~/Library/Saved Application State/org.alacritty.savedState",
+            ]
+          end
+          EOF
+
+      - name: Commit and push cask
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.alacritty_release.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/alacritty-signed.rb
+          git commit -m "Update alacritty-signed to $VERSION"
+          git push
