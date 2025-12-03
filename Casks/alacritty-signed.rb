@@ -1,8 +1,8 @@
 cask "alacritty-signed" do
-  version "0.0.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  version "0.16.1"
+  sha256 "ed8faa95ed3b5d5bc032c1b0e0e9bafc25a42c49dcdcf5646a8814992b84b7c0"
 
-  url "https://github.com/mattness/homebrew-alacritty/releases/download/v#{version}/Alacritty-#{version}-signed.dmg"
+  url "https://github.com/mattness/homebrew-alacritty/releases/download/v0.16.1/Alacritty-#{version}-signed.dmg"
   name "Alacritty (Signed & Notarized)"
   desc "GPU-accelerated terminal emulator (code-signed and notarized build)"
   homepage "https://github.com/alacritty/alacritty/"
